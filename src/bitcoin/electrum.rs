@@ -1,11 +1,9 @@
 use bitcoin::Transaction;
-use bitcoin::consensus::serde::hex;
-use http::response::Parts;
 use http::{Request, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::TcpStream;
 
 pub const BITCOIN_DUST_AMOUNT: u64 = 546; // in satoshis
 
@@ -138,14 +136,21 @@ impl ElectrsClient {
     ) -> Result<(StatusCode, Vec<u8>), Box<dyn Error + Send + Sync>> {
         // Connect to the server
         let addr = format!("{}:{}", self.host, self.port);
-        let mut stream = TcpStream::connect(&addr)?;
+        let mut stream = TcpStream::connect(&addr)
+            .map_err(|e| format!("Failed to connect to {}: {}", addr, e))?;
+
+        let host_header = if self.port == 80 || self.port == 443 {
+            self.host.clone()
+        } else {
+            format!("{}:{}", self.host, self.port)
+        };
 
         // Build HTTP request with proper headers
         let mut request_bytes = format!(
             "{} {} HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\n",
             request.method(),
             request.uri(),
-            self.host,
+            host_header,
             request.body().len()
         );
 
@@ -163,18 +168,35 @@ impl ElectrsClient {
         request_bytes.push_str("\r\n");
 
         // Send request
-        stream.write_all(request_bytes.as_bytes())?;
+        stream
+            .write_all(request_bytes.as_bytes())
+            .map_err(|e| format!("Failed to send request headers: {}", e))?;
+
         if !request.body().is_empty() {
-            stream.write_all(request.body())?;
+            stream
+                .write_all(request.body())
+                .map_err(|e| format!("Failed to send request body: {}", e))?;
         }
-        stream.flush()?;
 
-        // Shutdown write side to signal we're done sending
-        stream.shutdown(std::net::Shutdown::Write)?;
+        stream
+            .flush()
+            .map_err(|e| format!("Failed to flush stream: {}", e))?;
 
-        // Read response with timeout handling
+        println!("DEBUG: Request sent, reading response...");
+
+        // Set a read timeout to avoid hanging
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+            .map_err(|e| format!("Failed to set read timeout: {}", e))?;
+
+        // Read response
         let mut response = Vec::new();
-        stream.read_to_end(&mut response)?;
+        match stream.read_to_end(&mut response) {
+            Err(e) => {
+                return Err(format!("Failed to read response: {}", e).into());
+            }
+            Ok(_) => (),
+        }
 
         if response.is_empty() {
             return Err("Empty response from server".into());
@@ -183,27 +205,47 @@ impl ElectrsClient {
         // Parse response
         let response_str = String::from_utf8_lossy(&response);
 
-        // Find the end of headers
+        // Find the end of headers - try both \r\n\r\n and \n\n
         let header_end = response_str
             .find("\r\n\r\n")
+            .or_else(|| response_str.find("\n\n"))
             .ok_or("Invalid HTTP response: no header separator found")?;
 
         let headers_part = &response_str[..header_end];
-        let body_start = header_end + 4; // Skip "\r\n\r\n"
+        let body_start = if response_str[header_end..].starts_with("\r\n\r\n") {
+            header_end + 4
+        } else {
+            header_end + 2
+        };
 
-        let header_lines: Vec<&str> = headers_part.split("\r\n").collect();
+        // Split headers by line (handle both \r\n and \n)
+        let header_lines: Vec<&str> = if headers_part.contains("\r\n") {
+            headers_part.split("\r\n").collect()
+        } else {
+            headers_part.split('\n').collect()
+        };
+
         let status_line = header_lines.get(0).ok_or("Missing status line")?;
+
         let status_parts: Vec<&str> = status_line.split_whitespace().collect();
 
         if status_parts.len() < 2 {
-            return Err("Invalid status line".into());
+            return Err(format!("Invalid status line: {}", status_line).into());
         }
 
-        let status_code = status_parts[1].parse::<u16>()?;
-        let status = StatusCode::from_u16(status_code)?;
+        let status_code = status_parts[1]
+            .parse::<u16>()
+            .map_err(|e| format!("Invalid status code '{}': {}", status_parts[1], e))?;
+
+        let status = StatusCode::from_u16(status_code)
+            .map_err(|e| format!("Invalid status code {}: {}", status_code, e))?;
 
         // Extract body as bytes (not as string to avoid UTF-8 issues)
-        let body = response[body_start..].to_vec();
+        let body = if body_start < response.len() {
+            response[body_start..].to_vec()
+        } else {
+            Vec::new()
+        };
 
         Ok((status, body))
     }
@@ -419,6 +461,29 @@ impl ElectrsClient {
         Ok(serde_json::from_slice(&body)?)
     }
 
+    pub fn broadcast_transaction(
+        &self,
+        tx: &Transaction,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{}/tx", self.base_url);
+        let tx_hex = hex::encode(bitcoin::consensus::serialize(tx));
+        let request = Request::builder()
+            .method("POST")
+            .uri(&url)
+            .body(tx_hex.into_bytes())?;
+        let (status, body) = self.send_request(request)?;
+        if !status.is_success() {
+            return Err(format!(
+                "Server returned error {}: {}. Response: {}",
+                status,
+                url,
+                String::from_utf8_lossy(&body)
+            )
+            .into());
+        }
+        Ok(String::from_utf8(body)?)
+    }
+
     pub fn get_fee_estimates(
         &self,
     ) -> Result<std::collections::HashMap<String, f64>, Box<dyn Error + Send + Sync>> {
@@ -435,13 +500,49 @@ impl ElectrsClient {
     }
 }
 
+pub struct Merry {
+    client: ElectrsClient,
+}
+
+impl Merry {
+    pub fn new() -> Self {
+        Merry {
+            client: ElectrsClient::new("http://localhost:30000".to_string()).unwrap(),
+        }
+    }
+
+    pub fn fund(&self, address: &str) {
+        std::process::Command::new("merry")
+            .arg("faucet")
+            .arg("--to")
+            .arg(&address)
+            .output()
+            .expect("Failed to execute merry faucet command");
+    }
+
+    pub fn mine(&self) {
+        std::process::Command::new("merry")
+            .arg("rpc")
+            .arg("generatetoaddress")
+            .arg("1")
+            .arg("bcrt1qcw3q79t2zwd8h5mjnvwh8uv6k3zz8g7kk9t5e8")
+            .output()
+            .expect("Failed to execute merry mine command");
+    }
+
+    pub fn client(&self) -> &ElectrsClient {
+        &self.client
+    }
+}
+
 #[cfg(test)]
 mod test {
-    use crate::client::ElectrsClient;
+    use crate::bitcoin::electrum::ElectrsClient;
+
     #[tokio::test]
     async fn test_get_transaction() {
         // Initialize the client with the provided URL
-        let client = ElectrsClient::new("http://167.235.89.144:3000".to_string())
+        let client = ElectrsClient::new("http://127.0.0.1:30000".to_string())
             .expect("Failed to create ElectrsClient");
 
         // Transaction ID to fetch
