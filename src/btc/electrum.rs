@@ -537,7 +537,7 @@ impl Merry {
 
 #[cfg(test)]
 mod test {
-    use crate::bitcoin::electrum::ElectrsClient;
+    use crate::btc::electrum::ElectrsClient;
 
     #[tokio::test]
     async fn test_get_transaction() {

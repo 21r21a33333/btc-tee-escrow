@@ -1,6 +1,5 @@
 use ::bitcoin::Network;
-
-mod bitcoin;
+mod btc;
 mod models;
 mod services;
 mod storage;

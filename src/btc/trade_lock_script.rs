@@ -408,9 +408,8 @@ mod tests {
 #[cfg(test)]
 mod tx_test {
     use super::*;
-    use crate::bitcoin::electrum::{ElectrsClient, UTXO};
-    use crate::bitcoin::{Merry, SendTo, Spend, Wallet};
-    use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+    use crate::btc::Merry;
+    use crate::btc::electrum::UTXO;
     use bitcoin::sighash::Prevouts;
     use bitcoin::{
         Amount, Network, OutPoint, ScriptBuf, Sequence, TxOut, Txid, XOnlyPublicKey,
@@ -419,12 +418,8 @@ mod tx_test {
     use eyre::Result;
     use rand::RngCore;
     use std::str::FromStr;
-    use std::sync::Arc;
     use std::time::Duration;
 
-    // Test configuration constants
-    const REGTEST_ESPLORA_URL: &str = "http://0.0.0.0:30000";
-    const REGTEST_BITCOIN_RPC_URL: &str = "http://0.0.0.0:18443";
     const FUNDING_WAIT: Duration = Duration::from_secs(5);
 
     /// Test fixture containing keypairs, wallets, and configuration
@@ -434,8 +429,6 @@ mod tx_test {
         alice_pubkey: String,
         bob_pubkey: String,
         config: TradeLockConfig,
-        alice_wallet: Wallet,
-        bob_wallet: Wallet,
         merry: Merry,
     }
 
@@ -464,27 +457,7 @@ mod tx_test {
         // Create TradeLock configuration
         let config = TradeLockConfig::new(Network::Regtest, &alice_pubkey, &bob_pubkey)?;
 
-        // Create wallets
-        let alice_keypair = bitcoin::key::Keypair::from_secret_key(&secp, &alice_secret);
-        let bob_keypair = bitcoin::key::Keypair::from_secret_key(&secp, &bob_secret);
-
         let merry = Merry::new();
-        let alice_wallet = Wallet::new(
-            Arc::new(
-                ElectrsClient::new(REGTEST_ESPLORA_URL.to_string()).map_err(|e| eyre::eyre!(e))?,
-            ),
-            alice_keypair,
-            Network::Regtest,
-        )
-        .map_err(|e| eyre::eyre!(e))?;
-        let bob_wallet = Wallet::new(
-            Arc::new(
-                ElectrsClient::new(REGTEST_ESPLORA_URL.to_string()).map_err(|e| eyre::eyre!(e))?,
-            ),
-            bob_keypair,
-            Network::Regtest,
-        )
-        .map_err(|e| eyre::eyre!(e))?;
 
         Ok(TestFixture {
             alice_secret,
@@ -492,8 +465,6 @@ mod tx_test {
             alice_pubkey,
             bob_pubkey,
             config,
-            alice_wallet,
-            bob_wallet,
             merry,
         })
     }
@@ -544,6 +515,17 @@ mod tx_test {
         Ok(())
     }
 
+    fn get_random_btc_pubk() -> (bitcoin::secp256k1::PublicKey, bitcoin::secp256k1::PublicKey) {
+        let secp = Secp256k1::new();
+        let mut rng = rand::thread_rng();
+        // Generate keypairs
+        let mut alice_seed = [0u8; 32];
+        rng.fill_bytes(&mut alice_seed);
+        let alice_secret = SecretKey::from_slice(&alice_seed).unwrap();
+        let alice_secret = PublicKey::from_secret_key(&secp, &alice_secret);
+        (alice_secret, alice_secret)
+    }
+
     #[tokio::test]
     async fn test_multisig_spend_transaction() -> Result<()> {
         let fixture = setup_test_fixture()?;
@@ -552,64 +534,37 @@ mod tx_test {
             fixture.alice_pubkey, fixture.bob_pubkey
         );
 
-        // Fund wallets
-        fund_address(&fixture.merry, &fixture.alice_wallet.address().to_string()).await?;
-        fund_address(&fixture.merry, &fixture.bob_wallet.address().to_string()).await?;
+        let (_, random_pubkey) = get_random_btc_pubk();
+        let p2wpkh_address = Address::p2wpkh(
+            &bitcoin::CompressedPublicKey(random_pubkey),
+            Network::Regtest,
+        );
 
-        // Fund Alice's Taproot address
+        // Fund Alice's Taproot address and get UTXO
         let alice_addr = fixture.config.alice_taproot_address()?;
         println!("[DEBUG] Funding Alice's Taproot address: {}", alice_addr);
-        let utxos = fund_address(&fixture.merry, &alice_addr.to_string()).await?;
-        let utxo = utxos[0].clone();
+        let utxo = fund_and_get_first_utxo(&fixture, &alice_addr.to_string()).await?;
         println!("[DEBUG] Using UTXO: {:?}", utxo);
 
-        // Create multisig leaf script
+        // Create multisig leaf script and spend info
         let alice_xonly = XOnlyPublicKey::from_str(&fixture.alice_pubkey)?;
         let bob_xonly = XOnlyPublicKey::from_str(&fixture.bob_pubkey)?;
         let multisig_script = TradeLockConfig::multisig_leaf_script(&alice_xonly, &bob_xonly);
         println!("[DEBUG] Multisig script: {:?}", multisig_script);
-
-        // Build Taproot spend info
         let spend_info = TradeLockConfig::build_taproot_spend_info(&alice_xonly, &bob_xonly)?;
         println!("[DEBUG] Taproot spend info: {:?}", spend_info);
 
         // Create unsigned transaction
-        let unsigned_tx = bitcoin::Transaction {
-            version: Version::TWO,
-            lock_time: LockTime::from_height(0)?,
-            input: vec![bitcoin::TxIn {
-                previous_output: OutPoint::new(Txid::from_str(&utxo.txid)?, utxo.vout),
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-                witness: bitcoin::Witness::new(),
-            }],
-            output: vec![TxOut {
-                value: Amount::from_sat(99999838), // Subtract fee
-                script_pubkey: fixture.alice_wallet.address().script_pubkey(),
-            }],
-        };
+        let unsigned_tx = build_unsigned_tx(&utxo, 99999000, &p2wpkh_address.script_pubkey())?;
         println!("[DEBUG] Unsigned transaction: {:#?}", unsigned_tx);
 
         // Generate sighash
-        let sighash = bitcoin::sighash::SighashCache::new(&unsigned_tx)
-            .taproot_script_spend_signature_hash(
-                0,
-                &Prevouts::All(&[TxOut {
-                    value: Amount::from_sat(utxo.value),
-                    script_pubkey: alice_addr.script_pubkey(),
-                }]),
-                multisig_script.tapscript_leaf_hash(),
-                bitcoin::TapSighashType::Default,
-            )?;
+        let sighash = create_sighash(&unsigned_tx, &utxo, &alice_addr, &multisig_script)?;
         println!("[DEBUG] Sighash: {}", sighash);
 
         // Sign transaction
-        let secp = Secp256k1::new();
-        let msg = bitcoin::secp256k1::Message::from(sighash);
-        let alice_keypair = bitcoin::key::Keypair::from_secret_key(&secp, &fixture.alice_secret);
-        let alice_sig = secp.sign_schnorr_no_aux_rand(&msg, &alice_keypair);
-        let bob_keypair = bitcoin::key::Keypair::from_secret_key(&secp, &fixture.bob_secret);
-        let bob_sig = secp.sign_schnorr_no_aux_rand(&msg, &bob_keypair);
+        let (alice_sig, bob_sig) =
+            sign_multisig(&sighash, &fixture.alice_secret, &fixture.bob_secret);
 
         // Create witness
         let mut sighasher = bitcoin::sighash::SighashCache::new(unsigned_tx);
@@ -630,105 +585,209 @@ mod tx_test {
             .witness_mut(0)
             .ok_or_else(|| eyre::eyre!("Failed to get witness"))? = witness;
 
-        // Broadcast transaction
-        let signed_tx = sighasher.into_transaction();
-        let tx_hex = hex::encode(bitcoin::consensus::serialize(&signed_tx));
-        println!("[DEBUG] Signed transaction hex: {}", tx_hex);
-        let tx_hash = fixture
-            .merry
-            .client()
-            .broadcast_transaction(&signed_tx)
-            .map_err(|e| eyre::eyre!(e))?;
-        println!("[DEBUG] Broadcasted tx hash: {}", tx_hash);
-
-        // Verify transaction
-        assert_eq!(tx_hash.len(), 64, "Transaction hash should be 64 hex chars");
-        let status = fixture
-            .merry
-            .client()
-            .get_transaction_status(&tx_hash)
-            .map_err(|e| eyre::eyre!(e))?;
-        println!("[DEBUG] Transaction status: {:?}", status);
-        assert!(!status.confirmed, "Transaction should be in mempool");
+        // Broadcast and verify transaction
+        broadcast_and_verify_tx(&fixture, sighasher.into_transaction(), true).await?;
 
         Ok(())
     }
 
     #[tokio::test]
     async fn test_single_sig_refund_transaction() -> Result<()> {
-        let mut fixture = setup_test_fixture()?;
+        let fixture = setup_test_fixture()?;
         println!(
             "[LOG] Alice pubkey: {}, Bob pubkey: {}",
             fixture.alice_pubkey, fixture.bob_pubkey
         );
 
-        // Fund Alice's wallet
-        fund_address(&fixture.merry, &fixture.alice_wallet.address().to_string()).await?;
-        fixture.merry.mine();
-        std::thread::sleep(FUNDING_WAIT);
+        let (_, random_pubkey) = get_random_btc_pubk();
+        let random_p2wpkh_addr = Address::p2wpkh(
+            &bitcoin::CompressedPublicKey(random_pubkey),
+            Network::Regtest,
+        );
 
-        // Fund Alice's Taproot address
+        // Fund Alice's Taproot address and get UTXO
         let alice_addr = fixture.config.alice_taproot_address()?;
         println!("[LOG] Alice's Taproot address: {}", alice_addr);
         fund_address(&fixture.merry, &alice_addr.to_string()).await?;
         fixture.merry.mine();
         std::thread::sleep(FUNDING_WAIT);
 
-        // Get UTXOs
-        let utxos = fixture
-            .merry
-            .client()
-            .get_address_utxos(&alice_addr.to_string())
-            .map_err(|e| eyre::eyre!(e))?;
-        println!(
-            "[LOG] Retrieved UTXOs for Alice's Taproot address: {:?}",
-            utxos
-        );
-        assert!(!utxos.is_empty(), "No UTXOs found for Alice's address");
-        let utxo = utxos[0].clone();
+        let utxo = get_first_utxo(&fixture, &alice_addr.to_string()).await?;
         println!("[LOG] Selected UTXO: {:?}", utxo);
 
-        // Create refund script
+        // Create refund script and spend info
         let alice_xonly = XOnlyPublicKey::from_str(&fixture.alice_pubkey)?;
         let refund_script = TradeLockConfig::signature_check_script(&alice_xonly);
         println!(
             "[LOG] Created single-sig refund script: {:?}",
             refund_script
         );
-
-        // Build Taproot spend info
         let spend_info = TradeLockConfig::build_taproot_spend_info(
             &alice_xonly,
             &XOnlyPublicKey::from_str(&fixture.bob_pubkey)?,
         )?;
         println!("[LOG] Built Taproot spend info: {:?}", spend_info);
 
-        // Create spend
-        let spend = Spend {
-            address: alice_addr.clone(),
-            utxo,
-            sequence: Sequence::ENABLE_LOCKTIME_NO_RBF,
-            leaf: refund_script,
-            merkle_root: spend_info,
-            params: vec![None],
-        };
-        println!("[LOG] Created Spend object: {:?}", spend);
+        // Create unsigned transaction
+        let unsigned_tx = build_unsigned_tx(
+            &utxo,
+            utxo.value - 10000,
+            &random_p2wpkh_addr.script_pubkey(),
+        )?;
+        println!("[LOG] Unsigned transaction: {:#?}", unsigned_tx);
 
-        // Broadcast transaction
-        let tx_hash = fixture
-            .alice_wallet
-            .rbf(vec![], vec![spend])
-            .await
+        // Generate sighash
+        let sighash = create_sighash(&unsigned_tx, &utxo, &alice_addr, &refund_script)?;
+        println!("[LOG] Sighash: {}", sighash);
+
+        // Sign transaction
+        let alice_sig = sign_single_sig(&sighash, &fixture.alice_secret);
+
+        let cb = spend_info
+            .control_block(&(
+                refund_script.clone(),
+                bitcoin::taproot::LeafVersion::TapScript,
+            ))
+            .ok_or_else(|| eyre::eyre!("Failed to create control block"))?;
+
+        // Create witness
+        let mut sighasher = bitcoin::sighash::SighashCache::new(unsigned_tx);
+        let mut witness = bitcoin::Witness::new();
+        witness.push(alice_sig.serialize().to_vec());
+        witness.push(refund_script.clone());
+        witness.push(cb.serialize());
+        *sighasher
+            .witness_mut(0)
+            .ok_or_else(|| eyre::eyre!("Failed to get witness"))? = witness;
+
+        // Broadcast and verify transaction
+        broadcast_and_verify_tx(&fixture, sighasher.into_transaction(), false).await?;
+
+        Ok(())
+    }
+
+    // --- Helper functions for test refactoring ---
+
+    async fn fund_and_get_first_utxo(fixture: &TestFixture, address: &str) -> Result<UTXO> {
+        let utxos = fund_address(&fixture.merry, address).await?;
+        if utxos.is_empty() {
+            Err(eyre::eyre!("No UTXOs found for address: {}", address))
+        } else {
+            Ok(utxos[0].clone())
+        }
+    }
+
+    async fn get_first_utxo(fixture: &TestFixture, address: &str) -> Result<UTXO> {
+        let utxos = fixture
+            .merry
+            .client()
+            .get_address_utxos(address)
             .map_err(|e| eyre::eyre!(e))?;
-        println!("[LOG] Broadcasted transaction. Tx hash: {}", tx_hash);
+        if utxos.is_empty() {
+            Err(eyre::eyre!("No UTXOs found for address: {}", address))
+        } else {
+            Ok(utxos[0].clone())
+        }
+    }
+
+    fn build_unsigned_tx(
+        utxo: &UTXO,
+        value: u64,
+        output_script: &ScriptBuf,
+    ) -> Result<bitcoin::Transaction> {
+        Ok(bitcoin::Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::from_height(0)?,
+            input: vec![bitcoin::TxIn {
+                previous_output: OutPoint::new(Txid::from_str(&utxo.txid)?, utxo.vout),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(value),
+                script_pubkey: output_script.clone(),
+            }],
+        })
+    }
+
+    fn create_sighash(
+        unsigned_tx: &bitcoin::Transaction,
+        utxo: &UTXO,
+        input_addr: &Address,
+        script: &ScriptBuf,
+    ) -> Result<bitcoin::secp256k1::Message> {
+        let sighash = bitcoin::sighash::SighashCache::new(unsigned_tx)
+            .taproot_script_spend_signature_hash(
+                0,
+                &Prevouts::All(&[TxOut {
+                    value: Amount::from_sat(utxo.value),
+                    script_pubkey: input_addr.script_pubkey(),
+                }]),
+                script.tapscript_leaf_hash(),
+                bitcoin::TapSighashType::Default,
+            )?;
+        Ok(bitcoin::secp256k1::Message::from(sighash))
+    }
+
+    fn sign_multisig(
+        msg: &bitcoin::secp256k1::Message,
+        alice_secret: &SecretKey,
+        bob_secret: &SecretKey,
+    ) -> (
+        bitcoin::secp256k1::schnorr::Signature,
+        bitcoin::secp256k1::schnorr::Signature,
+    ) {
+        let secp = Secp256k1::new();
+        let alice_keypair = bitcoin::key::Keypair::from_secret_key(&secp, alice_secret);
+        let bob_keypair = bitcoin::key::Keypair::from_secret_key(&secp, bob_secret);
+        let alice_sig = secp.sign_schnorr_no_aux_rand(msg, &alice_keypair);
+        let bob_sig = secp.sign_schnorr_no_aux_rand(msg, &bob_keypair);
+        (alice_sig, bob_sig)
+    }
+
+    fn sign_single_sig(
+        msg: &bitcoin::secp256k1::Message,
+        secret: &SecretKey,
+    ) -> bitcoin::secp256k1::schnorr::Signature {
+        let secp = Secp256k1::new();
+        let keypair = bitcoin::key::Keypair::from_secret_key(&secp, secret);
+        secp.sign_schnorr_no_aux_rand(msg, &keypair)
+    }
+
+    async fn broadcast_and_verify_tx(
+        fixture: &TestFixture,
+        signed_tx: bitcoin::Transaction,
+        debug: bool,
+    ) -> Result<()> {
+        let tx_hex = hex::encode(bitcoin::consensus::serialize(&signed_tx));
+        if debug {
+            println!("[DEBUG] Signed transaction hex: {}", tx_hex);
+        } else {
+            println!("[LOG] Signed transaction hex: {}", tx_hex);
+        }
+        let tx_hash = fixture
+            .merry
+            .client()
+            .broadcast_transaction(&signed_tx)
+            .map_err(|e| eyre::eyre!(e))?;
+        if debug {
+            println!("[DEBUG] Broadcasted tx hash: {}", tx_hash);
+        } else {
+            println!("[LOG] Broadcasted tx hash: {}", tx_hash);
+        }
+        assert_eq!(tx_hash.len(), 64, "Transaction hash should be 64 hex chars");
         let status = fixture
             .merry
             .client()
             .get_transaction_status(&tx_hash)
             .map_err(|e| eyre::eyre!(e))?;
-        println!("[LOG] Transaction status: {:?}", status);
+        if debug {
+            println!("[DEBUG] Transaction status: {:?}", status);
+        } else {
+            println!("[LOG] Transaction status: {:?}", status);
+        }
         assert!(!status.confirmed, "Transaction should be in mempool");
-
         Ok(())
     }
 }
