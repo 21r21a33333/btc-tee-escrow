@@ -47,19 +47,28 @@ pub static NUMS_INTERNAL_KEY: Lazy<XOnlyPublicKey> = Lazy::new(|| {
 pub struct TradeLockConfig {
     pub alice_pubkey: XOnlyPublicKey,
     pub bob_pubkey: XOnlyPublicKey,
+    pub cosigner_pubkey: XOnlyPublicKey,
     pub network: Network,
 }
 
 impl TradeLockConfig {
-    /// Creates a new trade lock configuration with Alice and Bob's public keys and network.
-    pub fn new(network: Network, alice_pubkey: &str, bob_pubkey: &str) -> Result<Self> {
+    /// Creates a new trade lock configuration with Alice, Bob, and cosigner's public keys and network.
+    pub fn new(
+        network: Network,
+        alice_pubkey: &str,
+        bob_pubkey: &str,
+        cosigner_pubkey: &str,
+    ) -> Result<Self> {
         let alice_pubkey = XOnlyPublicKey::from_str(alice_pubkey)
             .map_err(|e| eyre!("Invalid Alice public key: {}", e))?;
         let bob_pubkey = XOnlyPublicKey::from_str(bob_pubkey)
             .map_err(|e| eyre!("Invalid Bob public key: {}", e))?;
+        let cosigner_pubkey = XOnlyPublicKey::from_str(cosigner_pubkey)
+            .map_err(|e| eyre!("Invalid cosigner public key: {}", e))?;
         Ok(Self {
             alice_pubkey,
             bob_pubkey,
+            cosigner_pubkey,
             network,
         })
     }
@@ -72,45 +81,35 @@ impl TradeLockConfig {
         hex::encode(hasher.finalize())
     }
 
-    /// Builds a 2-of-2 multisig script for the Taproot script path (trade completion).
-    fn multisig_leaf_script(
-        alice_pubkey: &XOnlyPublicKey,
-        bob_pubkey: &XOnlyPublicKey,
-    ) -> ScriptBuf {
+    /// Builds a 2-of-2 multisig script for a Taproot script path.
+    fn multisig_script(pubkey1: &XOnlyPublicKey, pubkey2: &XOnlyPublicKey) -> ScriptBuf {
         Builder::new()
-            .push_slice(&alice_pubkey.serialize())
+            .push_slice(&pubkey1.serialize())
             .push_opcode(opcodes::all::OP_CHECKSIG)
-            .push_slice(&bob_pubkey.serialize())
+            .push_slice(&pubkey2.serialize())
             .push_opcode(opcodes::all::OP_CHECKSIGADD)
             .push_int(2)
             .push_opcode(opcodes::all::OP_NUMEQUAL)
             .into_script()
     }
 
-    /// Builds a single-key signature check script for the Taproot script path (e.g., refund).
-    fn signature_check_script(pubkey: &XOnlyPublicKey) -> ScriptBuf {
-        Builder::new()
-            .push_slice(&pubkey.serialize())
-            .push_opcode(opcodes::all::OP_CHECKSIG)
-            .into_script()
-    }
-
-    /// Constructs Taproot spend info with a multisig leaf and a refund leaf.
+    /// Constructs Taproot spend info with a trade completion leaf and a refund leaf.
     fn build_taproot_spend_info(
         owner: &XOnlyPublicKey,
         recipient: &XOnlyPublicKey,
+        cosigner: &XOnlyPublicKey,
     ) -> Result<TaprootSpendInfo> {
-        let multisig_leaf = Self::multisig_leaf_script(owner, recipient);
-        let signature_leaf = Self::signature_check_script(owner);
+        let trade_leaf = Self::multisig_script(owner, recipient);
+        let refund_leaf = Self::multisig_script(owner, cosigner);
 
         let mut taproot_builder = TaprootBuilder::new();
-        // Add multisig leaf at depth 1 for trade completion
+        // Add trade completion leaf at depth 1
         taproot_builder = taproot_builder
-            .add_leaf(1, multisig_leaf)
-            .map_err(|e| eyre!("Failed to add multisig leaf to Taproot tree: {}", e))?;
-        // Add refund leaf at depth 1 for owner refund
+            .add_leaf(1, trade_leaf)
+            .map_err(|e| eyre!("Failed to add trade completion leaf to Taproot tree: {}", e))?;
+        // Add refund leaf at depth 1
         taproot_builder = taproot_builder
-            .add_leaf(1, signature_leaf)
+            .add_leaf(1, refund_leaf)
             .map_err(|e| eyre!("Failed to add refund leaf to Taproot tree: {}", e))?;
 
         if !taproot_builder.is_finalizable() {
@@ -125,8 +124,12 @@ impl TradeLockConfig {
 
     /// Generates Alice's Taproot address for the trade lock.
     pub fn alice_taproot_address(&self) -> Result<Address> {
-        let spend_info = Self::build_taproot_spend_info(&self.alice_pubkey, &self.bob_pubkey)
-            .map_err(|e| eyre!("Failed to create Alice's Taproot spend info: {}", e))?;
+        let spend_info = Self::build_taproot_spend_info(
+            &self.alice_pubkey,
+            &self.bob_pubkey,
+            &self.cosigner_pubkey,
+        )
+        .map_err(|e| eyre!("Failed to create Alice's Taproot spend info: {}", e))?;
         Ok(Address::p2tr(
             &*SECP,
             spend_info.internal_key(),
@@ -137,8 +140,12 @@ impl TradeLockConfig {
 
     /// Generates Bob's Taproot address for the trade lock.
     pub fn bob_taproot_address(&self) -> Result<Address> {
-        let spend_info = Self::build_taproot_spend_info(&self.bob_pubkey, &self.alice_pubkey)
-            .map_err(|e| eyre!("Failed to create Bob's Taproot spend info: {}", e))?;
+        let spend_info = Self::build_taproot_spend_info(
+            &self.bob_pubkey,
+            &self.alice_pubkey,
+            &self.cosigner_pubkey,
+        )
+        .map_err(|e| eyre!("Failed to create Bob's Taproot spend info: {}", e))?;
         Ok(Address::p2tr(
             &*SECP,
             spend_info.internal_key(),
@@ -172,7 +179,7 @@ mod tests {
     use std::str::FromStr;
 
     // Helper function to generate valid XOnlyPublicKey for testing
-    fn generate_test_keypair() -> (String, String) {
+    fn generate_test_keypair() -> (String, String, String) {
         let secp = Secp256k1::new();
         let secret_key = SecretKey::from_slice(&[0x42; 32]).unwrap();
         let public_key = PublicKey::from_secret_key(&secp, &secret_key);
@@ -180,27 +187,45 @@ mod tests {
         let another_secret_key = SecretKey::from_slice(&[0x43; 32]).unwrap();
         let another_public_key = PublicKey::from_secret_key(&secp, &another_secret_key);
         let (another_xonly, _) = another_public_key.x_only_public_key();
-        (xonly.to_string(), another_xonly.to_string())
+        let cosigner_secret_key = SecretKey::from_slice(&[0x44; 32]).unwrap();
+        let cosigner_public_key = PublicKey::from_secret_key(&secp, &cosigner_secret_key);
+        let (cosigner_xonly, _) = cosigner_public_key.x_only_public_key();
+        (
+            xonly.to_string(),
+            another_xonly.to_string(),
+            cosigner_xonly.to_string(),
+        )
     }
 
     #[test]
     fn test_new_tradelock_config_valid() {
-        let (alice_pubkey, bob_pubkey) = generate_test_keypair();
-        let config = TradeLockConfig::new(Network::Testnet, &alice_pubkey, &bob_pubkey);
+        let (alice_pubkey, bob_pubkey, cosigner_pubkey) = generate_test_keypair();
+        let config = TradeLockConfig::new(
+            Network::Testnet,
+            &alice_pubkey,
+            &bob_pubkey,
+            &cosigner_pubkey,
+        );
         assert!(config.is_ok());
         let config = config.unwrap();
         assert_eq!(config.network, Network::Testnet);
         assert_eq!(config.alice_pubkey.to_string(), alice_pubkey);
         assert_eq!(config.bob_pubkey.to_string(), bob_pubkey);
+        assert_eq!(config.cosigner_pubkey.to_string(), cosigner_pubkey);
     }
 
     #[test]
     fn test_new_tradelock_config_invalid_pubkeys() {
         let invalid_pubkey = "invalid_pubkey";
-        let valid_pubkey = generate_test_keypair().0;
+        let (alice_pubkey, bob_pubkey, cosigner_pubkey) = generate_test_keypair();
 
         // Test with invalid Alice pubkey
-        let result = TradeLockConfig::new(Network::Testnet, invalid_pubkey, &valid_pubkey);
+        let result = TradeLockConfig::new(
+            Network::Testnet,
+            invalid_pubkey,
+            &bob_pubkey,
+            &cosigner_pubkey,
+        );
         assert!(result.is_err());
         assert!(
             result
@@ -211,7 +236,12 @@ mod tests {
         );
 
         // Test with invalid Bob pubkey
-        let result = TradeLockConfig::new(Network::Testnet, &valid_pubkey, invalid_pubkey);
+        let result = TradeLockConfig::new(
+            Network::Testnet,
+            &alice_pubkey,
+            invalid_pubkey,
+            &cosigner_pubkey,
+        );
         assert!(result.is_err());
         assert!(
             result
@@ -220,13 +250,37 @@ mod tests {
                 .to_string()
                 .contains("Invalid Bob public key")
         );
+
+        // Test with invalid cosigner pubkey
+        let result =
+            TradeLockConfig::new(Network::Testnet, &alice_pubkey, &bob_pubkey, invalid_pubkey);
+        assert!(result.is_err());
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("Invalid cosigner public key")
+        );
     }
 
     #[test]
     fn test_trade_id_deterministic() {
-        let (alice_pubkey, bob_pubkey) = generate_test_keypair();
-        let config1 = TradeLockConfig::new(Network::Testnet, &alice_pubkey, &bob_pubkey).unwrap();
-        let config2 = TradeLockConfig::new(Network::Testnet, &alice_pubkey, &bob_pubkey).unwrap();
+        let (alice_pubkey, bob_pubkey, cosigner_pubkey) = generate_test_keypair();
+        let config1 = TradeLockConfig::new(
+            Network::Testnet,
+            &alice_pubkey,
+            &bob_pubkey,
+            &cosigner_pubkey,
+        )
+        .unwrap();
+        let config2 = TradeLockConfig::new(
+            Network::Testnet,
+            &alice_pubkey,
+            &bob_pubkey,
+            &cosigner_pubkey,
+        )
+        .unwrap();
 
         let trade_id1 = config1.trade_id();
         let trade_id2 = config2.trade_id();
@@ -239,13 +293,13 @@ mod tests {
     }
 
     #[test]
-    fn test_multisig_leaf_script() {
-        let (alice_pubkey_str, bob_pubkey_str) = generate_test_keypair();
+    fn test_multisig_script() {
+        let (alice_pubkey_str, bob_pubkey_str, cosigner_pubkey_str) = generate_test_keypair();
         let alice_pubkey = XOnlyPublicKey::from_str(&alice_pubkey_str).unwrap();
         let bob_pubkey = XOnlyPublicKey::from_str(&bob_pubkey_str).unwrap();
-        let script = TradeLockConfig::multisig_leaf_script(&alice_pubkey, &bob_pubkey);
+        let cosigner_pubkey = XOnlyPublicKey::from_str(&cosigner_pubkey_str).unwrap();
+        let script = TradeLockConfig::multisig_script(&alice_pubkey, &bob_pubkey);
 
-        dbg!(&script.to_asm_string());
         // Check script structure: <32-byte push> <pubkey1> OP_CHECKSIG <32-byte push> <pubkey2> OP_CHECKSIGADD 2 OP_NUMEQUAL
         let script_bytes = script.as_bytes();
         assert_eq!(
@@ -255,13 +309,13 @@ mod tests {
         );
         assert_eq!(
             script_bytes[0],
-            0x20, // 32-byte push opcode for Alice pubkey
-            "Expected 0x20 push opcode for Alice pubkey"
+            0x20, // 32-byte push opcode for first pubkey
+            "Expected 0x20 push opcode for first pubkey"
         );
         assert_eq!(
             script_bytes[1..33],
             alice_pubkey.serialize(),
-            "Incorrect Alice pubkey"
+            "Incorrect first pubkey"
         );
         assert_eq!(
             script_bytes[33],
@@ -270,13 +324,13 @@ mod tests {
         );
         assert_eq!(
             script_bytes[34],
-            0x20, // 32-byte push opcode for Bob pubkey
-            "Expected 0x20 push opcode for Bob pubkey"
+            0x20, // 32-byte push opcode for second pubkey
+            "Expected 0x20 push opcode for second pubkey"
         );
         assert_eq!(
             script_bytes[35..67],
             bob_pubkey.serialize(),
-            "Incorrect Bob pubkey"
+            "Incorrect second pubkey"
         );
         assert_eq!(
             script_bytes[67],
@@ -293,44 +347,30 @@ mod tests {
             opcodes::all::OP_NUMEQUAL.to_u8(),
             "Expected OP_NUMEQUAL"
         );
-    }
 
-    #[test]
-    fn test_signature_check_script() {
-        let (alice_pubkey_str, _) = generate_test_keypair();
-        let alice_pubkey = XOnlyPublicKey::from_str(&alice_pubkey_str).unwrap();
-        let script = TradeLockConfig::signature_check_script(&alice_pubkey);
-
-        // Check script structure: <pubkey> OP_CHECKSIG
-        let script_bytes = script.as_bytes();
+        // Test refund script (owner + cosigner)
+        let refund_script = TradeLockConfig::multisig_script(&alice_pubkey, &cosigner_pubkey);
+        let refund_script_bytes = refund_script.as_bytes();
         assert_eq!(
-            script_bytes.len(),
-            34,
-            "Expected signature check script length: 34 bytes"
+            refund_script_bytes.len(),
+            70,
+            "Expected refund multisig script length: 70 bytes"
         );
         assert_eq!(
-            script_bytes[0],
-            0x20, // 32-byte push opcode
-            "Expected 0x20 push opcode for 32-byte pubkey"
-        );
-        assert_eq!(
-            script_bytes[1..33],
-            alice_pubkey.serialize(),
-            "Incorrect pubkey"
-        );
-        assert_eq!(
-            script_bytes[33],
-            opcodes::all::OP_CHECKSIG.to_u8(),
-            "Expected OP_CHECKSIG"
+            refund_script_bytes[35..67],
+            cosigner_pubkey.serialize(),
+            "Incorrect cosigner pubkey"
         );
     }
 
     #[test]
     fn test_build_taproot_spend_info() {
-        let (alice_pubkey_str, bob_pubkey_str) = generate_test_keypair();
+        let (alice_pubkey_str, bob_pubkey_str, cosigner_pubkey_str) = generate_test_keypair();
         let alice_pubkey = XOnlyPublicKey::from_str(&alice_pubkey_str).unwrap();
         let bob_pubkey = XOnlyPublicKey::from_str(&bob_pubkey_str).unwrap();
-        let spend_info = TradeLockConfig::build_taproot_spend_info(&alice_pubkey, &bob_pubkey);
+        let cosigner_pubkey = XOnlyPublicKey::from_str(&cosigner_pubkey_str).unwrap();
+        let spend_info =
+            TradeLockConfig::build_taproot_spend_info(&alice_pubkey, &bob_pubkey, &cosigner_pubkey);
         assert!(spend_info.is_ok(), "Failed to build Taproot spend info");
         let spend_info = spend_info.unwrap();
         assert_eq!(
@@ -343,8 +383,14 @@ mod tests {
 
     #[test]
     fn test_alice_taproot_address() {
-        let (alice_pubkey, bob_pubkey) = generate_test_keypair();
-        let config = TradeLockConfig::new(Network::Testnet, &alice_pubkey, &bob_pubkey).unwrap();
+        let (alice_pubkey, bob_pubkey, cosigner_pubkey) = generate_test_keypair();
+        let config = TradeLockConfig::new(
+            Network::Testnet,
+            &alice_pubkey,
+            &bob_pubkey,
+            &cosigner_pubkey,
+        )
+        .unwrap();
         let address = config.alice_taproot_address();
         assert!(
             address.is_ok(),
@@ -363,8 +409,14 @@ mod tests {
 
     #[test]
     fn test_bob_taproot_address() {
-        let (alice_pubkey, bob_pubkey) = generate_test_keypair();
-        let config = TradeLockConfig::new(Network::Testnet, &alice_pubkey, &bob_pubkey).unwrap();
+        let (alice_pubkey, bob_pubkey, cosigner_pubkey) = generate_test_keypair();
+        let config = TradeLockConfig::new(
+            Network::Testnet,
+            &alice_pubkey,
+            &bob_pubkey,
+            &cosigner_pubkey,
+        )
+        .unwrap();
         let address = config.bob_taproot_address();
         assert!(address.is_ok(), "Failed to generate Bob's Taproot address");
         let address = address.unwrap();
@@ -380,8 +432,14 @@ mod tests {
 
     #[test]
     fn test_try_into_swap() {
-        let (alice_pubkey, bob_pubkey) = generate_test_keypair();
-        let config = TradeLockConfig::new(Network::Testnet, &alice_pubkey, &bob_pubkey).unwrap();
+        let (alice_pubkey, bob_pubkey, cosigner_pubkey) = generate_test_keypair();
+        let config = TradeLockConfig::new(
+            Network::Testnet,
+            &alice_pubkey,
+            &bob_pubkey,
+            &cosigner_pubkey,
+        )
+        .unwrap();
         let swap: Result<Swap> = config.try_into();
         assert!(swap.is_ok(), "Failed to convert TradeLockConfig to Swap");
         let swap = swap.unwrap();
@@ -405,6 +463,7 @@ mod tests {
         );
     }
 }
+
 #[cfg(test)]
 mod tx_test {
     use super::*;
@@ -426,8 +485,10 @@ mod tx_test {
     struct TestFixture {
         alice_secret: SecretKey,
         bob_secret: SecretKey,
+        cosigner_secret: SecretKey,
         alice_pubkey: String,
         bob_pubkey: String,
+        cosigner_pubkey: String,
         config: TradeLockConfig,
         merry: Merry,
     }
@@ -454,16 +515,31 @@ mod tx_test {
             .0
             .to_string();
 
+        let mut cosigner_seed = [0u8; 32];
+        rng.fill_bytes(&mut cosigner_seed);
+        let cosigner_secret = SecretKey::from_slice(&cosigner_seed)?;
+        let cosigner_pubkey = PublicKey::from_secret_key(&secp, &cosigner_secret)
+            .x_only_public_key()
+            .0
+            .to_string();
+
         // Create TradeLock configuration
-        let config = TradeLockConfig::new(Network::Regtest, &alice_pubkey, &bob_pubkey)?;
+        let config = TradeLockConfig::new(
+            Network::Regtest,
+            &alice_pubkey,
+            &bob_pubkey,
+            &cosigner_pubkey,
+        )?;
 
         let merry = Merry::new();
 
         Ok(TestFixture {
             alice_secret,
             bob_secret,
+            cosigner_secret,
             alice_pubkey,
             bob_pubkey,
+            cosigner_pubkey,
             config,
             merry,
         })
@@ -488,8 +564,8 @@ mod tx_test {
     async fn test_fund_tradelock_addresses() -> Result<()> {
         let fixture = setup_test_fixture()?;
         println!(
-            "[DEBUG] Alice pubkey: {}, Bob pubkey: {}",
-            fixture.alice_pubkey, fixture.bob_pubkey
+            "[DEBUG] Alice pubkey: {}, Bob pubkey: {}, Cosigner pubkey: {}",
+            fixture.alice_pubkey, fixture.bob_pubkey, fixture.cosigner_pubkey
         );
 
         // Fund Alice's Taproot address
@@ -530,8 +606,8 @@ mod tx_test {
     async fn test_multisig_spend_transaction() -> Result<()> {
         let fixture = setup_test_fixture()?;
         println!(
-            "[DEBUG] Alice pubkey: {}, Bob pubkey: {}",
-            fixture.alice_pubkey, fixture.bob_pubkey
+            "[DEBUG] Alice pubkey: {}, Bob pubkey: {}, Cosigner pubkey: {}",
+            fixture.alice_pubkey, fixture.bob_pubkey, fixture.cosigner_pubkey
         );
 
         let (_, random_pubkey) = get_random_btc_pubk();
@@ -546,12 +622,14 @@ mod tx_test {
         let utxo = fund_and_get_first_utxo(&fixture, &alice_addr.to_string()).await?;
         println!("[DEBUG] Using UTXO: {:?}", utxo);
 
-        // Create multisig leaf script and spend info
+        // Create multisig trade completion script and spend info
         let alice_xonly = XOnlyPublicKey::from_str(&fixture.alice_pubkey)?;
         let bob_xonly = XOnlyPublicKey::from_str(&fixture.bob_pubkey)?;
-        let multisig_script = TradeLockConfig::multisig_leaf_script(&alice_xonly, &bob_xonly);
-        println!("[DEBUG] Multisig script: {:?}", multisig_script);
-        let spend_info = TradeLockConfig::build_taproot_spend_info(&alice_xonly, &bob_xonly)?;
+        let cosigner_xonly = XOnlyPublicKey::from_str(&fixture.cosigner_pubkey)?;
+        let trade_script = TradeLockConfig::multisig_script(&alice_xonly, &bob_xonly);
+        println!("[DEBUG] Trade completion script: {:?}", trade_script);
+        let spend_info =
+            TradeLockConfig::build_taproot_spend_info(&alice_xonly, &bob_xonly, &cosigner_xonly)?;
         println!("[DEBUG] Taproot spend info: {:?}", spend_info);
 
         // Create unsigned transaction
@@ -559,7 +637,7 @@ mod tx_test {
         println!("[DEBUG] Unsigned transaction: {:#?}", unsigned_tx);
 
         // Generate sighash
-        let sighash = create_sighash(&unsigned_tx, &utxo, &alice_addr, &multisig_script)?;
+        let sighash = create_sighash(&unsigned_tx, &utxo, &alice_addr, &trade_script)?;
         println!("[DEBUG] Sighash: {}", sighash);
 
         // Sign transaction
@@ -570,7 +648,7 @@ mod tx_test {
         let mut sighasher = bitcoin::sighash::SighashCache::new(unsigned_tx);
         let cb = spend_info
             .control_block(&(
-                multisig_script.clone(),
+                trade_script.clone(),
                 bitcoin::taproot::LeafVersion::TapScript,
             ))
             .ok_or_else(|| eyre::eyre!("Failed to create control block"))?;
@@ -579,7 +657,7 @@ mod tx_test {
         for param in &[bob_sig.serialize().to_vec(), alice_sig.serialize().to_vec()] {
             witness.push(param.clone());
         }
-        witness.push(multisig_script.clone());
+        witness.push(trade_script.clone());
         witness.push(cb.serialize());
         *sighasher
             .witness_mut(0)
@@ -592,11 +670,11 @@ mod tx_test {
     }
 
     #[tokio::test]
-    async fn test_single_sig_refund_transaction() -> Result<()> {
+    async fn test_refund_transaction() -> Result<()> {
         let fixture = setup_test_fixture()?;
         println!(
-            "[LOG] Alice pubkey: {}, Bob pubkey: {}",
-            fixture.alice_pubkey, fixture.bob_pubkey
+            "[LOG] Alice pubkey: {}, Bob pubkey: {}, Cosigner pubkey: {}",
+            fixture.alice_pubkey, fixture.bob_pubkey, fixture.cosigner_pubkey
         );
 
         let (_, random_pubkey) = get_random_btc_pubk();
@@ -615,16 +693,15 @@ mod tx_test {
         let utxo = get_first_utxo(&fixture, &alice_addr.to_string()).await?;
         println!("[LOG] Selected UTXO: {:?}", utxo);
 
-        // Create refund script and spend info
+        // Create refund script (Alice + cosigner) and spend info
         let alice_xonly = XOnlyPublicKey::from_str(&fixture.alice_pubkey)?;
-        let refund_script = TradeLockConfig::signature_check_script(&alice_xonly);
-        println!(
-            "[LOG] Created single-sig refund script: {:?}",
-            refund_script
-        );
+        let cosigner_xonly = XOnlyPublicKey::from_str(&fixture.cosigner_pubkey)?;
+        let refund_script = TradeLockConfig::multisig_script(&alice_xonly, &cosigner_xonly);
+        println!("[LOG] Created refund multisig script: {:?}", refund_script);
         let spend_info = TradeLockConfig::build_taproot_spend_info(
             &alice_xonly,
             &XOnlyPublicKey::from_str(&fixture.bob_pubkey)?,
+            &cosigner_xonly,
         )?;
         println!("[LOG] Built Taproot spend info: {:?}", spend_info);
 
@@ -641,7 +718,8 @@ mod tx_test {
         println!("[LOG] Sighash: {}", sighash);
 
         // Sign transaction
-        let alice_sig = sign_single_sig(&sighash, &fixture.alice_secret);
+        let (alice_sig, cosigner_sig) =
+            sign_multisig(&sighash, &fixture.alice_secret, &fixture.cosigner_secret);
 
         let cb = spend_info
             .control_block(&(
@@ -653,7 +731,12 @@ mod tx_test {
         // Create witness
         let mut sighasher = bitcoin::sighash::SighashCache::new(unsigned_tx);
         let mut witness = bitcoin::Witness::new();
-        witness.push(alice_sig.serialize().to_vec());
+        for param in &[
+            cosigner_sig.serialize().to_vec(),
+            alice_sig.serialize().to_vec(),
+        ] {
+            witness.push(param.clone());
+        }
         witness.push(refund_script.clone());
         witness.push(cb.serialize());
         *sighasher
@@ -732,27 +815,18 @@ mod tx_test {
 
     fn sign_multisig(
         msg: &bitcoin::secp256k1::Message,
-        alice_secret: &SecretKey,
-        bob_secret: &SecretKey,
+        key1: &SecretKey,
+        key2: &SecretKey,
     ) -> (
         bitcoin::secp256k1::schnorr::Signature,
         bitcoin::secp256k1::schnorr::Signature,
     ) {
         let secp = Secp256k1::new();
-        let alice_keypair = bitcoin::key::Keypair::from_secret_key(&secp, alice_secret);
-        let bob_keypair = bitcoin::key::Keypair::from_secret_key(&secp, bob_secret);
-        let alice_sig = secp.sign_schnorr_no_aux_rand(msg, &alice_keypair);
-        let bob_sig = secp.sign_schnorr_no_aux_rand(msg, &bob_keypair);
-        (alice_sig, bob_sig)
-    }
-
-    fn sign_single_sig(
-        msg: &bitcoin::secp256k1::Message,
-        secret: &SecretKey,
-    ) -> bitcoin::secp256k1::schnorr::Signature {
-        let secp = Secp256k1::new();
-        let keypair = bitcoin::key::Keypair::from_secret_key(&secp, secret);
-        secp.sign_schnorr_no_aux_rand(msg, &keypair)
+        let keypair1 = bitcoin::key::Keypair::from_secret_key(&secp, key1);
+        let keypair2 = bitcoin::key::Keypair::from_secret_key(&secp, key2);
+        let sig1 = secp.sign_schnorr_no_aux_rand(msg, &keypair1);
+        let sig2 = secp.sign_schnorr_no_aux_rand(msg, &keypair2);
+        (sig1, sig2)
     }
 
     async fn broadcast_and_verify_tx(

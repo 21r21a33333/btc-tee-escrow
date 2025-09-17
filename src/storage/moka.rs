@@ -38,4 +38,17 @@ impl Storage for MokaStrore {
     async fn get_challenge(&self, id: &str) -> Result<Option<Challenge>> {
         Ok(self.challenges.get(id).await)
     }
+    async fn clear_challenge(&self, id: &str) -> Result<()> {
+        self.challenges.invalidate(id).await;
+        Ok(())
+    }
+    async fn append_challenge(&self, swap_id: &str, challenge: Challenge) -> Result<()> {
+        let mut swap = match self.swaps.get(swap_id).await {
+            Some(swap) => swap,
+            None => return Err(eyre::eyre!("Swap not found for swap_id: {}", swap_id)),
+        };
+        swap.challenges.push(serde_json::to_value(challenge)?);
+        self.swaps.insert(swap_id.to_string(), swap).await;
+        Ok(())
+    }
 }
